@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.i12bp8.netneighbors",
+  "name": "NetNeighbors",
+  "version": "0.1.0",
+  "author": "i12bp8",
+  "license": "MIT",
+  "description": "Fing-style Wi-Fi radar for the bar: one click shows every device on your network — vendor, hostname, MAC — and flags new ones that appear.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "NetNeighbors",
+    "description": "Who's on this Wi-Fi? Scans the local network straight from the bar and lists every device with vendor, hostname and MAC. Rootless: reads the kernel neighbor table after a gentle probe sweep. No daemon, no privileges.",
+    "category": "Security",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshSeconds": 30
+    }
+  }
+}
