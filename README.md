@@ -5,7 +5,7 @@ Click the icon, get the whole network in a couple of seconds: every device
 with vendor, hostname, MAC — plus NEW badges when a device shows up that
 nobody has seen before.
 
-![NetNeighbors panel](netneighbors-preview.png)
+![NetNeighbors panel](preview.png)
 
 ## Install
 
