@@ -46,7 +46,15 @@ while closed) — toggle "Auto" in the footer to stop them.
 
 ## How it works
 
-`scanner.py` runs with **no privileges and no dependencies**:
+`scanner.py` runs with **no privileges** and only stock tooling — nothing
+extra to install:
+
+- Python 3 standard library (gzip, json, sockets, ipaddress, threads)
+- `ip` from iproute2 (always present on Arch)
+- optional `avahi-resolve` (Avahi) and `nmcli` (NetworkManager) for
+  hostnames and SSID; the plugin degrades gracefully without them
+- the full IEEE OUI database ships bundled (`oui.json.gz`), so no
+  download and no `hwdata` dependency
 
 1. Finds the primary IPv4 subnet from `ip -j -4 addr` (the interface that
    owns the default route).
@@ -69,8 +77,13 @@ The shell runs the scan fully detached and picks the result up from an
 atomically-written JSON file, so a shell reload never kills a scan mid-way.
 
 Only ever touches the local subnet you are already connected to; each scan
-is a few hundred tiny UDP datagrams plus one file read. No daemon, no root,
-no config.
+is a few hundred tiny UDP datagrams plus one file read. No daemon, no root.
+
+**Configuration is never modified.** The plugin itself only writes to
+`~/.local/share/io.github.i12bp8.netneighbors/` (scan state + device
+history, both safe to delete any time). Adding the widget to the bar and
+moving it are done by your own `omarchy plugin enable` / `omarchy bar move`
+commands — it never edits your shell config on its own.
 
 ## Privacy & ethics
 
@@ -101,6 +114,14 @@ omarchy bar set io.github.i12bp8.netneighbors refreshSeconds 15   # rescan caden
 ```sh
 omarchy plugin remove io.github.i12bp8.netneighbors
 ```
+
+## Security
+
+Plugins run **unsandboxed** inside the shell with your user permissions.
+This plugin is plain Python + QML, and the only thing it sends on the
+network is one UDP datagram per address (ARP resolution — replies are
+never parsed). Marketplace approval covers listing only, not auditing:
+review the source before enabling on machines you care about.
 
 ## License
 
