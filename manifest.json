@@ -15,7 +15,7 @@
   "barWidget": {
     "displayName": "NetNeighbors",
     "description": "Who's on this Wi-Fi? Scans the local network straight from the bar and lists every device with vendor, hostname and MAC. Rootless: reads the kernel neighbor table after a gentle probe sweep. No daemon, no privileges.",
-    "category": "Security",
+    "category": "Widgets",
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
