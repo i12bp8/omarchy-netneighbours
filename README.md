@@ -1,149 +1,162 @@
 # NetNeighbors
 
-**Who's on this Wi-Fi?** A Fing-style neighbor radar for the Omarchy bar.
-Click the icon, get the whole network in a couple of seconds: every device
-with vendor, hostname, MAC — plus NEW badges when a device shows up that
-nobody has seen before.
+**Who's on your Wi-Fi right now?** NetNeighbors puts a friendly radar button
+in your Omarchy bar. Click it and, a couple of seconds later, you see the
+whole picture: every device on your network — phones, laptops, TVs,
+printers, smart-home gear — with vendor, name, IP and MAC. When an
+unfamiliar device shows up, it gets a **NEW** badge so you notice right
+away.
 
 ![NetNeighbors panel](preview.png)
 
-## Install
+## Features
 
-From a public git URL (once published):
+- **One-click network overview** — every device that answers, listed with a
+  recognizable icon, vendor, hostname, IP and MAC address.
+- **New-device alerts** — devices nobody has seen before are flagged
+  **NEW**, both in the list and with a banner when you open the panel.
+- **Away view** — known devices that aren't answering right now stay listed
+  (dimmed) so you can see who's missing.
+- **Easy copying** — click a device to copy its IP, right-click to copy its
+  MAC. Great for router allowlists, MAC filters and notes.
+- **Zero setup** — no accounts, no cloud, no daemon, no root. Just add the
+  widget and it works, refreshing on its own.
+- **Quiet by design** — it only ever looks at the network you're connected
+  to, and sends nothing anywhere.
+
+## Requirements
+
+- Omarchy (the bar and shell).
+- **Python 3** — usually already installed; if not, install the `python`
+  package (`sudo pacman -S python` on Arch) and the scan will work.
+- Everything else is bundled or comes with the system — no downloads needed.
+  Optional extras only improve device names: Avahi (`avahi`) and
+  NetworkManager (`nmcli`, standard on Omarchy).
+
+## Install
 
 ```sh
 omarchy plugin add https://github.com/i12bp8/omarchy-netneighbours.git --enable
 ```
 
-Or during development, drop (or symlink) this folder at:
+The globe icon appears on the right side of the bar. If you don't see it,
+add it with:
 
-```
-~/.config/omarchy/plugins/io.github.i12bp8.netneighbors/
+```sh
 omarchy plugin enable io.github.i12bp8.netneighbors right
 ```
 
-Saved changes under the plugin folder hot-reload automatically.
+## Using NetNeighbors
 
-## Use
+1. **Click the globe icon** in the bar. A scan starts automatically a
+   moment after Omarchy boots, and the panel refreshes whenever you open it
+   and the last scan is older than ~10 seconds.
+2. **Read the room.** The top of the panel shows your network (SSID and
+   range). Below it, one row per device: icon, name, IP, vendor and MAC.
+   Your router is tagged **GATEWAY**, your own machine **YOU**, and
+   anything new carries a **NEW** badge. Devices that were here recently
+   but aren't answering now sit under **AWAY**, dimmed.
+3. **Copy an address** — click a row for its IP, right-click for its MAC
+   (a small toast confirms). Useful for router admin pages and MAC filters.
+4. **Watch for newcomers.** If a device you've never seen appears while the
+   panel is closed, the little counter next to the bar icon turns accent
+   colored, and a banner greets you next time you open the panel.
 
-1. Click the Wi-Fi icon in the bar. The first scan happens on its own a
-   moment after the shell starts; opening the panel refreshes if the last
-   scan is older than 10 seconds.
-2. Read the room: SSID + network range on top, then one row per device —
-   icon, name, IP, vendor, MAC. The gateway is tagged **GATEWAY**, your own
-   machine is tagged **YOU**, and anything new carries a **NEW** badge.
-3. Click a row to copy its IP; right-click to copy its MAC. A toast
-   confirms what was copied.
-4. New devices that appear while you're away turn the bar counter accent
-   colored and raise a **NEW devices** banner next time you look.
+The number beside the icon is the live count of *other* devices. Scans
+repeat automatically — about every 30 s while the panel is open, at least
+every minute while closed. Toggle the **Auto** switch in the panel footer
+(or press `A`) to stop background refreshes.
 
-Keyboard inside the panel: `R` rescans, `A` toggles auto-refresh, `Esc`
-closes, `Tab` moves to the next panel.
+Keyboard shortcuts inside the panel:
 
-The small number beside the icon is the live count of other devices.
-Rescans happen automatically (every 30 s while open, at least every minute
-while closed) — toggle "Auto" in the footer to stop them.
+| Key | Action |
+|-----|--------|
+| `R` | Scan now |
+| `A` | Toggle auto-refresh |
+| `Esc` | Close the panel |
+| `Tab` | Move to the next panel |
 
-## How it works
-
-`scanner.py` runs with **no privileges** and only stock tooling — nothing
-extra to install beyond Python itself (`python3` on Arch; the shell invokes
-`/usr/bin/python3`):
-
-- Python 3 standard library (gzip, json, sockets, ipaddress, threads)
-- `ip` from iproute2 (always present on Arch)
-- optional `avahi-resolve` (Avahi) and `nmcli` (NetworkManager) for
-  hostnames and SSID; the plugin degrades gracefully without them
-- the full IEEE OUI database ships bundled (`oui.json.gz`), so no
-  download and no `hwdata` dependency
-
-1. Finds the primary IPv4 subnet from `ip -j -4 addr` (the interface that
-   owns the default route).
-2. Gently probes every address on it with one UDP datagram to port 9
-   (discard). It never needs a reply: simply addressing a host makes the
-   kernel resolve it with ARP, so every awake device lands in the neighbor
-   table with a MAC address — firewalls included.
-3. Reads back the kernel neighbor table (`ip -j neigh show`, with
-   `/proc/net/arp` as fallback) and reports every host found.
-4. Names come from reverse DNS (parallel, time-boxed), an mDNS sweep via
-   `avahi-resolve` when installed, and names remembered from earlier scans.
-5. Vendors are resolved from `/usr/share/hwdata/oui.txt` (Arch ships it),
-   with the bundled `oui.json` as a portable fallback.
-6. A small history file (`~/.local/share/io.github.i12bp8.netneighbors/`)
-   remembers every MAC it has seen, so genuinely new devices stand out.
-   The first-ever scan is treated as a baseline, not a flood of "new"
-   devices.
-
-The shell runs the scanner as a **managed, time-boxed, single-instance
-process** and picks the result up from an atomically-written JSON file:
-
-- the scanner is a Quickshell `Process` child (never a detached process):
-  the shell knows its PID, sends it SIGTERM when a scan is superseded or
-  cancelled, and kills it on panel/shell reload or shutdown;
-- an `flock`-based lock file guarantees only one scan runs at a time — a
-  new scan retires a stale one instead of overlapping it;
-- a watchdog caps each scan at ~16 s, so a wedged run terminates itself;
-- every child command's output is captured with a byte ceiling, DNS lookups
-  are bounded in concurrency, and all state files (history, scan result)
-  are written via unpredictable temp names + atomic rename into a private
-  `0700` directory — no symlink-following or predictable `.tmp` writes;
-- the result payload is capped (rows, fields, bytes) by the scanner and the
-  same caps are enforced when the panel loads it.
-
-Only ever touches the local subnet you are already connected to; each scan
-is a few hundred tiny UDP datagrams plus one file read. No daemon, no root.
-
-**Configuration is never modified.** The plugin itself only writes to
-`~/.local/share/io.github.i12bp8.netneighbors/` (scan state + device
-history, both safe to delete any time). Adding the widget to the bar and
-moving it are done by your own `omarchy plugin enable` / `omarchy bar move`
-commands — it never edits your shell config on its own.
-
-## Privacy & ethics
-
-Everything stays on your machine — history is a local JSON file you can
-delete. MAC addresses identify *devices*, not people; use this on networks
-you own or where you're allowed to be curious. On café/guest networks with
-client isolation you will mostly see the gateway: that's the network
-protecting itself, not a bug.
-
-## Configure
+## Configuration
 
 ```sh
-omarchy bar move io.github.i12bp8.netneighbors --section right   # move it
-omarchy bar set io.github.i12bp8.netneighbors refreshSeconds 15   # rescan cadence (15-600)
+# Move the icon to another part of the bar
+omarchy bar move io.github.i12bp8.netneighbors --section left
+
+# Change how often it rescans (between 15 and 600 seconds)
+omarchy bar set io.github.i12bp8.netneighbors refreshSeconds 60
 ```
+
+## Privacy
+
+NetNeighbors is completely local:
+
+- **Nothing leaves your machine.** There is no cloud service, no
+  telemetry, no daemon phoning home. Scanning means sending one tiny
+  "are you there?" packet to each address on your network so devices wake
+  up and answer — replies stay on your own network.
+- **It remembers what it has seen.** MAC addresses of discovered devices
+  are kept in a small file at
+  `~/.local/share/io.github.i12bp8.netneighbors/history.json` so it can
+  tell you when something *new* appears. Delete that file any time — the
+  next scan just starts a fresh baseline.
+- **It only writes to its own folder.** NetNeighbors never changes your
+  shell configuration or any other file.
+- **Be a good neighbor.** This is a tool for networks you own or are
+  allowed to explore. On café, hotel or guest networks, other clients are
+  usually hidden from you (client isolation) — that's the network
+  protecting itself, so you'll mostly see the gateway there.
 
 ## Troubleshooting
 
-- **Panel says "Scan failed / no IPv4"**: you're likely offline or on a
-  VPN-only connection. Connect to a LAN/Wi-Fi first.
-- **Only the gateway shows**: client isolation (see above), or the other
-  devices are asleep — Wi-Fi radios that are powered down don't answer ARP.
-- **Vendors show "Unknown"**: many phones randomize their MAC these days
-  (locally administered addresses have no IEEE vendor), so that's expected.
+- **I only see my router (the gateway).** You're likely on a guest or
+  public network with *client isolation*, which hides devices from each
+  other. On your home network, sleeping devices (or phones with Wi-Fi
+  power-saving) also don't answer until they wake up.
+- **Vendors show "Unknown".** Modern phones randomize their MAC address,
+  and randomized addresses have no vendor entry — completely normal.
+- **"Scan failed / no IPv4".** You're offline or on a VPN-only link.
+  Connect to your Wi-Fi or LAN first, then press `R`.
+- **Scans always fail?** Make sure Python 3 is installed:
+  `python3 --version`. If it isn't, `sudo pacman -S python` fixes it.
+- **The icon disappeared.** Re-add it with
+  `omarchy plugin enable io.github.i12bp8.netneighbors right`.
 
-## Remove
+## Uninstall
 
 ```sh
 omarchy plugin remove io.github.i12bp8.netneighbors
 ```
 
-## Security
+Optionally delete its data folder as well:
+`rm -rf ~/.local/share/io.github.i12bp8.netneighbors` — nothing else is
+touched.
 
-Plugins run **unsandboxed** inside the shell with your user permissions.
-This plugin is plain Python + QML, and the only thing it sends on the
-network is one UDP datagram per address (ARP resolution — replies are
-never parsed).
+<details>
+<summary>Technical notes (for the curious)</summary>
 
-Hardening in place (see also "How it works" above): the scanner runs from
-an absolute interpreter path with an isolated interpreter and a
-whitelisted environment, it is single-instance and hard time-boxed, child
-command output and the result payload are byte/cardinality-bounded on both
-the producing and the consuming side, and the state directory is private
-with symlink-safe, atomic file writes. Marketplace approval covers listing
-only, not auditing: review the source before enabling on machines you care
-about.
+Scans are quick and harmless: NetNeighbors finds your network's IP range,
+sends a single UDP "wake up" packet to each address so the kernel resolves
+it, then reads your computer's own neighbor table to see who answered.
+Names come from reverse DNS, mDNS (when Avahi is present) and names
+remembered from earlier scans; vendors come from a database bundled with
+the plugin. All of this runs without root privileges.
+
+Engineering-wise, the scanner runs as a managed, single-instance,
+time-boxed subprocess: scans can never overlap, a stale scan is retired
+when a new one starts, each scan is hard-capped at about 16 seconds, and
+all command output and result data are size-bounded. Its state directory
+is private (`0700`) and every file write is atomic and symlink-safe.
+See `scanner.py` and `Panel.qml` for the details, and the plugin manifest
+(`manifest.json`) for the marketplace entry.
+
+**Installing from a local folder (developers):** copy or symlink this
+folder to
+`~/.config/omarchy/plugins/io.github.i12bp8.netneighbors/`, then run
+`omarchy plugin enable io.github.i12bp8.netneighbors right`. Changes you
+save under the plugin folder reload automatically, which makes local
+iteration fast.
+
+</details>
 
 ## License
 
