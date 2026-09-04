@@ -27,8 +27,9 @@ away.
 ## Requirements
 
 - Omarchy (the bar and shell).
-- **Python 3** — usually already installed; if not, install the `python`
-  package (`sudo pacman -S python` on Arch) and the scan will work.
+- **Python 3** — present on almost every Omarchy system. Verify with
+  `python3 --version`. NetNeighbors only uses Python's standard library;
+  if Python is missing, scans report an error until it is available.
 - Everything else is bundled or comes with the system — no downloads needed.
   Optional extras only improve device names: Avahi (`avahi`) and
   NetworkManager (`nmcli`, standard on Omarchy).
@@ -116,8 +117,9 @@ NetNeighbors is completely local:
   and randomized addresses have no vendor entry — completely normal.
 - **"Scan failed / no IPv4".** You're offline or on a VPN-only link.
   Connect to your Wi-Fi or LAN first, then press `R`.
-- **Scans always fail?** Make sure Python 3 is installed:
-  `python3 --version`. If it isn't, `sudo pacman -S python` fixes it.
+- **Scans always fail?** The scanner needs Python 3. Run
+  `python3 --version` — if it prints nothing, Python isn't installed and
+  NetNeighbors can't scan until it is.
 - **The icon disappeared.** Re-add it with
   `omarchy plugin enable io.github.i12bp8.netneighbors right`.
 
