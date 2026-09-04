@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.i12bp8.netneighbors",
   "name": "NetNeighbors",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "i12bp8",
   "license": "MIT",
   "description": "Fing-style Wi-Fi radar for the bar: one click shows every device on your network — vendor, hostname, MAC — and flags new ones that appear.",

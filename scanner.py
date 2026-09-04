@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """NetNeighbors LAN scanner.
 
 Answers one question: "who is on this network right now?"
@@ -19,20 +19,46 @@ The scan is deliberately rootless and dependency-free:
 6. Remember what was seen before (plain JSON under ~/.local/share) so
    freshly appearing MACs can be flagged as NEW.
 
-Output: a single JSON object on stdout.
+Output: a single bounded JSON object on stdout and, when --out is given,
+atomically at that path.
+
+Security contract (mirrored by Panel.qml):
+
+* Single instance: an flock()ed lock file serialises scans. A newer scan
+  sends a verified SIGTERM to a stale holder instead of overlapping it,
+  and the lock dies with its process (even on SIGKILL/crash).
+* Hard time budget: a watchdog thread caps total runtime and writes the
+  final "timed out" verdict itself, so a wedged or orphaned instance can
+  never linger indefinitely.
+* Bounded reads: every child command's stdout/stderr is captured with a
+  byte ceiling; the process group is killed if it exceeds the ceiling or
+  its timeout. History reads are size-bounded.
+* Bounded writes: all state files are written via unpredictable
+  tempfile.mkstemp names + atomic os.replace; file opens use O_NOFOLLOW
+  and the state directory is private (0700), so no predictable .tmp or
+  symlink-following write target exists. No path is ever followed that
+  an untrusted file could have planted.
+* Bounded output: the result payload is capped in bytes, rows and string
+  lengths (see MAX_* below); Panel.qml enforces the same caps on load.
 
 Only ever touches hosts on the local subnet you are already connected to,
 sends a handful of small UDP datagrams per scan, and needs no privileges.
 """
 
+import errno
+import fcntl
+import gzip
 import ipaddress
 import json
 import os
 import re
 import shutil
+import signal
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -44,6 +70,27 @@ STATE_DIR = Path(
     os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
 ) / PLUGIN_ID
 HISTORY_FILE = STATE_DIR / "history.json"
+LOCK_FILE = STATE_DIR / "scan.lock"
+
+# --------------------------------------------------------------------------- #
+# Resource / output bounds (the producer half of the size contract).
+# --------------------------------------------------------------------------- #
+
+MAX_RESULT_BYTES = 1_500_000      # ceiling for the serialised result payload
+MAX_ONLINE_ROWS = 512             # device rows emitted per scan (online)
+MAX_AWAY_ROWS = 8                 # remembered-but-away rows emitted per scan
+MAX_TOTAL_ROWS = MAX_ONLINE_ROWS + MAX_AWAY_ROWS + 1  # + the "self" row
+MAX_CAPTURE_BYTES = 262144        # stdout ceiling for captured child commands
+MAX_STDERR_BYTES = 65536          # stderr ceiling for captured child commands
+MAX_HISTORY_BYTES = 1_000_000     # history file read ceiling
+MAX_HISTORY_ENTRIES = 400         # history entries retained
+MAX_FIELD_LEN = 200               # per-string cap when (re)storing history
+
+# Hard overall budget for one scan; the watchdog below enforces it even if
+# a phase hangs. NETNEIGHBORS_SCAN_BUDGET exists for tests only - the shell
+# runs this script with a whitelisted environment that never carries it.
+OVERALL_BUDGET_SECONDS = 16.0
+LOCK_WAIT_SECONDS = 4.0
 
 OUI_PATHS = [
     "/usr/share/hwdata/oui.txt",
@@ -101,24 +148,103 @@ GENERIC_NAME_RE = re.compile(
 )
 
 
-def sh(args, timeout=6):
-    """Run a command, return (returncode, stdout, stderr)."""
+def _kill_group(proc):
+    """Kill a child and its whole process group (it may have spawned tools)."""
     try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-        return proc.returncode, proc.stdout, proc.stderr
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def sh(args, timeout=6, max_stdout=MAX_CAPTURE_BYTES, max_stderr=MAX_STDERR_BYTES):
+    """Run a command, return (returncode, stdout, stderr).
+
+    Producer-side byte bound: stdout/stderr are captured only up to
+    max_stdout/max_stderr bytes each. If a child exceeds its ceiling or
+    its timeout, the whole process group is killed and the call fails, so
+    callers never parse truncated output and memory stays bounded no
+    matter what the child emits.
+    """
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,  # own process group -> killpg below
+        )
     except FileNotFoundError:
         return -1, "", "not found"
     except Exception as exc:  # noqa: BLE001 - boundary script, report anything
         return -1, "", str(exc)
 
+    out = bytearray()
+    err = bytearray()
+    verdict = {"killed": False, "reason": ""}
 
-def fail(error):
-    print(json.dumps({"ok": False, "error": str(error)}))
-    sys.exit(0)
+    def pump(stream, sink, cap, key):
+        try:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    break
+                room = cap - len(sink)
+                if room > 0:
+                    sink += chunk[:room]
+                if len(sink) >= cap:
+                    verdict["killed"] = True
+                    verdict["reason"] = "%s exceeded its %d-byte capture cap" % (key, cap)
+                    _kill_group(proc)
+                    return
+        except Exception:  # noqa: BLE001 - read side died with the child
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    threads = [
+        threading.Thread(target=pump, args=(proc.stdout, out, max_stdout, "stdout"), daemon=True),
+        threading.Thread(target=pump, args=(proc.stderr, err, max_stderr, "stderr"), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        verdict["killed"] = True
+        verdict["reason"] = "timed out after %ss" % timeout
+        _kill_group(proc)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:  # noqa: PLC0415 - unreachable in practice
+            pass
+
+    for thread in threads:
+        thread.join(timeout=5)
+
+    rc = proc.returncode if proc.returncode is not None else -1
+    text_out = bytes(out).decode("utf-8", "replace")
+    text_err = bytes(err).decode("utf-8", "replace")
+    if verdict["killed"]:
+        return -1, text_out, text_err or verdict["reason"]
+    return rc, text_out, text_err
 
 
 def iso_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _iso_epoch(text):
+    try:
+        parsed = datetime.fromisoformat(str(text or ""))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -268,23 +394,44 @@ def read_neighbors(iface, candidates):
 # Names
 # --------------------------------------------------------------------------- #
 
+DNS_MAX_LOOKUPS = 96    # defensive cap on addresses resolved per call
+DNS_MAX_WORKERS = 24    # concurrent resolver threads (never one per host)
+DNS_BUDGET_SECONDS = 1.5
+
 
 def reverse_names(ips):
-    """Best-effort rDNS in parallel threads, bounded wait."""
+    """Best-effort rDNS with bounded concurrency and a bounded wait.
+
+    Never spawns one thread per address: lookups run on at most
+    DNS_MAX_WORKERS daemon threads, only DNS_MAX_LOOKUPS addresses are
+    considered, and the call returns after DNS_BUDGET_SECONDS. Daemon
+    threads can never hold up process exit.
+    """
     names = {}
+    todo = [ip for ip in ips if ip][:DNS_MAX_LOOKUPS]
+    if not todo:
+        return names
+
+    slots = threading.BoundedSemaphore(DNS_MAX_WORKERS)
+    deadline = time.monotonic() + DNS_BUDGET_SECONDS
 
     def lookup(ip):
-        try:
-            names[ip] = socket.gethostbyaddr(ip)[0]
-        except Exception:  # noqa: BLE001
-            pass
+        with slots:
+            try:
+                names[ip] = socket.gethostbyaddr(ip)[0]
+            except Exception:  # noqa: BLE001
+                pass
 
-    threads = [threading.Thread(target=lookup, args=(ip,), daemon=True) for ip in ips]
-    for thread in threads:
+    threads = []
+    for ip in todo:
+        if time.monotonic() >= deadline:
+            break
+        thread = threading.Thread(target=lookup, args=(ip,), daemon=True)
         thread.start()
-    deadline = time.monotonic() + 1.2
+        threads.append(thread)
+
     while time.monotonic() < deadline:
-        if all(ip in names for ip in ips):
+        if all(ip in names for ip in todo):
             break
         time.sleep(0.05)
     return names
@@ -292,6 +439,7 @@ def reverse_names(ips):
 
 def mdns_names(ips):
     """mDNS reverse sweep through avahi-resolve when available."""
+    ips = [ip for ip in ips if ip][:64]
     if not shutil.which("avahi-resolve") or not ips:
         return {}
     rc, out, _ = sh(["avahi-resolve", "-a", "-4", "-t", "2"] + list(ips), timeout=5)
@@ -356,7 +504,6 @@ def load_vendor_tables():
     # without hwdata installed; system tables still win on overlap.
     bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), "oui.json.gz")
     try:
-        import gzip
         with gzip.open(bundled, "rt", encoding="utf-8") as handle:
             db = json.load(handle)
         if isinstance(db, dict) and db:
@@ -391,29 +538,264 @@ def classify_device(vendor, hostname):
 
 
 # --------------------------------------------------------------------------- #
-# History (new-device detection)
+# State directory + history (symlink-safe, size-bounded)
 # --------------------------------------------------------------------------- #
 
 
+def _state_dir_ok():
+    """Create/validate the private state dir; refuse symlinked directories."""
+    try:
+        STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = STATE_DIR.lstat()
+        return (
+            stat.S_ISDIR(info.st_mode)
+            and not stat.S_ISLNK(info.st_mode)
+            and info.st_uid == os.geteuid()
+        )
+    except OSError:
+        return False
+
+
+def _trim_history(history, limit=MAX_HISTORY_ENTRIES):
+    """Keep the `limit` most recently seen entries."""
+    if len(history) <= limit:
+        return history
+    ordered = sorted(
+        history.items(),
+        key=lambda kv: _iso_epoch((kv[1] or {}).get("last")) or 0.0,
+        reverse=True,
+    )
+    return dict(ordered[:limit])
+
+
 def load_history():
-    existed = HISTORY_FILE.exists()
+    """Bounded, symlink-safe read of the remembered-device history.
+
+    The open refuses symlinks (O_NOFOLLOW) and the read is capped at
+    MAX_HISTORY_BYTES, so a planted or corrupted history can neither
+    redirect the scan into other files nor exhaust memory. Any anomaly is
+    treated as "no history yet" (baseline scan).
+    """
+    try:
+        fd = os.open(HISTORY_FILE, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError:
+        return False, {}
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            raw = handle.read(MAX_HISTORY_BYTES + 1)
+    except OSError:
+        return False, {}
+    if len(raw) > MAX_HISTORY_BYTES:
+        return False, {}
+    try:
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        return False, {}
+    if not isinstance(data, dict) or not isinstance(data.get("devices"), dict):
+        return False, {}
+
     history = {}
-    if existed:
-        try:
-            raw = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
-            if isinstance(raw, dict) and isinstance(raw.get("devices"), dict):
-                history = raw["devices"]
-        except Exception:  # noqa: BLE001
-            existed = False
-    return existed, history
+    for mac, meta in data["devices"].items():
+        if not isinstance(mac, str) or not isinstance(meta, dict):
+            continue
+        cleaned = {}
+        for key in ("first", "last", "name"):
+            value = meta.get(key)
+            if isinstance(value, str):
+                cleaned[key] = value[:MAX_FIELD_LEN]
+        if cleaned:
+            history[str(mac)[:64]] = cleaned
+    return True, _trim_history(history)
 
 
 def save_history(history):
+    """Write history atomically via an unpredictable temp name.
+
+    mkstemp names are unpredictable (no attacker-predictable .tmp),
+    os.replace swaps the final file in place without ever following a
+    symlink at the destination, and the private 0700 state directory
+    keeps the whole area out of other local users' reach.
+    """
+    if not _state_dir_ok():
+        return
+    history = _trim_history(history)
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        HISTORY_FILE.write_text(json.dumps({"devices": history}, indent=1), encoding="utf-8")
+        payload = json.dumps({"devices": history}, indent=1)
     except Exception:  # noqa: BLE001
+        return
+    if len(payload.encode("utf-8")) > MAX_HISTORY_BYTES:
+        return
+
+    fd = None
+    tmp = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(prefix=".history-", suffix=".tmp", dir=str(STATE_DIR))
+        tmp = Path(tmp_name)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        fd = None
+        os.replace(tmp, HISTORY_FILE)
+        tmp = None
+    except OSError:
         pass
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+# --------------------------------------------------------------------------- #
+# Single-instance lock
+# --------------------------------------------------------------------------- #
+
+
+def _signal_stale_holder(pid):
+    """SIGTERM a lock holder - only after verifying it is really ours."""
+    if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
+        return
+    try:
+        with open("/proc/%d/status" % pid, "r", encoding="ascii", errors="replace") as handle:
+            content = handle.read(4096)
+        uid_line = next((line for line in content.splitlines() if line.startswith("Uid:")), "")
+        tokens = uid_line.split()
+        if len(tokens) < 2 or int(tokens[1]) != os.geteuid():
+            return  # not our process - never signal a stranger
+    except (OSError, ValueError):
+        return  # holder already gone; the flock will be free momentarily
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
+def acquire_scan_lock(timeout=LOCK_WAIT_SECONDS):
+    """Serialise scans with an flock()ed lock file.
+
+    Only one scan instance may run at a time. A live holder (verified to
+    belong to this user) receives SIGTERM so a newer scan supersedes a
+    stale one instead of overlapping it. The flock is released by the
+    kernel when the holder exits or dies, so even SIGKILL or a crash can
+    never leak the lock.
+
+    Returns the open lock fd (keep it for the lifetime of the scan);
+    raises RuntimeError when the lock cannot be had in time.
+    """
+    if not _state_dir_ok():
+        raise RuntimeError("cannot create the private state directory")
+
+    fd = None
+    for _ in range(2):  # a planted symlink at the lock path is unlinked, not followed
+        try:
+            fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+            break
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                try:
+                    os.unlink(LOCK_FILE)  # removes the symlink entry, never its target
+                except OSError:
+                    pass
+                continue
+            raise RuntimeError("cannot open the scan lock: %s" % exc) from exc
+    if fd is None:
+        raise RuntimeError("cannot open the scan lock")
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.ftruncate(fd, 0)
+            os.write(fd, b"%d\n" % os.getpid())
+            return fd
+        except OSError as exc:
+            if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                os.close(fd)
+                raise RuntimeError("scan lock error: %s" % exc) from exc
+
+        holder = None
+        try:
+            raw = os.pread(fd, 64, 0).decode("ascii", "replace").strip()
+            holder = int(raw.splitlines()[0])
+        except Exception:  # noqa: BLE001
+            pass
+        _signal_stale_holder(holder)
+
+        if time.monotonic() >= deadline:
+            os.close(fd)
+            raise RuntimeError("another scan is still running; try again shortly")
+        time.sleep(0.1)
+
+
+# --------------------------------------------------------------------------- #
+# Result emission (bounded + atomic)
+# --------------------------------------------------------------------------- #
+
+
+def write_result_file(target, raw):
+    """Atomically write the result file via an unpredictable temp name."""
+    try:
+        path = Path(target)
+        parent = path.parent
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            return False
+
+        fd = None
+        tmp = None
+        try:
+            fd, tmp_name = tempfile.mkstemp(prefix=".scan-", suffix=".tmp", dir=str(parent))
+            tmp = Path(tmp_name)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(raw.encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            fd = None
+            os.replace(tmp, path)  # replaces any entry at target, symlink included
+            tmp = None
+            return True
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if tmp is not None:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+    except Exception:  # noqa: BLE001 - report, never crash
+        return False
+
+
+def watchdog_main(done, emit, deadline, scan_id):
+    """Hard ceiling for one scan run.
+
+    If the main scan thread has not finished by `deadline`, this thread
+    writes the final "timed out" verdict itself and terminates the
+    process - deterministically, even if a phase or a resolver thread is
+    wedged. os._exit is deliberate: daemon threads that are stuck in C
+    calls must not keep the process alive.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        done.wait(remaining)
+    if done.is_set():
+        return
+    payload = {"ok": False, "error": "scan exceeded its time budget"}
+    if scan_id is not None:
+        payload["scanId"] = scan_id
+    emit(payload)
+    os._exit(0)  # noqa: PLR1722 - see docstring
 
 
 # --------------------------------------------------------------------------- #
@@ -421,258 +803,295 @@ def save_history(history):
 # --------------------------------------------------------------------------- #
 
 
+def parse_args(argv):
+    """Parse --out <path> and --scan-id <n>; everything else is ignored."""
+    out_path = None
+    scan_id = None
+    index = 0
+    while index < len(argv):
+        if argv[index] == "--out" and index + 1 < len(argv):
+            out_path = argv[index + 1]
+            index += 2
+            continue
+        if argv[index] == "--scan-id" and index + 1 < len(argv):
+            try:
+                scan_id = int(argv[index + 1])
+            except (TypeError, ValueError):
+                scan_id = None
+            index += 2
+            continue
+        index += 1
+    return out_path, scan_id
+
+
 def main():
     started = time.monotonic()
+    budget_env = os.environ.get("NETNEIGHBORS_SCAN_BUDGET")
+    try:
+        budget = float(budget_env) if budget_env else OVERALL_BUDGET_SECONDS
+    except ValueError:
+        budget = OVERALL_BUDGET_SECONDS
+    deadline = started + budget
+
+    out_path, scan_id = parse_args(sys.argv[1:])
     oui_tables = load_vendor_tables()
 
-    # Optional --out <path>: additionally write the result JSON atomically.
-    # The Omarchy shell runs this scan detached and watches that file.
-    out_path = None
-    rest_args = sys.argv[1:]
-    if "--out" in rest_args:
-        idx = rest_args.index("--out")
-        if idx + 1 < len(rest_args):
-            out_path = rest_args[idx + 1]
-
+    def fail_payload(error):
+        payload = {"ok": False, "error": str(error)}
+        if scan_id is not None:
+            payload["scanId"] = scan_id
+        return payload
 
     def emit(payload):
+        """Print the payload and atomically write it to --out, if given."""
         raw = json.dumps(payload, ensure_ascii=False)
-        print(raw)
+        if len(raw.encode("utf-8")) > MAX_RESULT_BYTES:
+            # Keep every output channel inside the size contract.
+            raw = json.dumps(
+                {"ok": False, "error": "scan result exceeded its size contract"},
+                ensure_ascii=False,
+            )
         if out_path:
-            try:
-                target = Path(out_path)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                tmp = target.with_name(target.name + ".tmp")
-                tmp.write_text(raw + "\n", encoding="utf-8")
-                os.replace(str(tmp), str(target))
-            except Exception as exc:  # noqa: BLE001 - report, never crash
-                print("warning: scan output not written: %s" % exc, file=sys.stderr)
-
-    try:
-        net = discover_network()
-    except Exception as exc:  # noqa: BLE001
-        emit({"ok": False, "error": str(exc)})
-        return
-    iface = net["iface"]
-    subnet = ipaddress.ip_network(net["network"])
-    self_ip = net["ip"]
-    self_mac = net.get("mac", "")
-    self_host = socket.gethostname() or "this device"
-    ssid = discover_ssid(iface)
-
-    candidates = {str(ip) for ip in subnet.hosts() if str(ip) != self_ip}
-    if not candidates:
-        raise RuntimeError("no addressable hosts in %s" % net["network"])
-
-    # 1. Probe sweep - ARP resolution is the point.
-    with ThreadPoolExecutor(max_workers=96) as pool:
-        list(pool.map(probe_host, candidates))
-    time.sleep(0.5)
-
-    # 2. Neighbor table.
-    neighbors = read_neighbors(iface, candidates)
-
-    # 3. Router: the route gateway, or anything the kernel flags as a router.
-    router_macs = set()
-    for ip, entry in neighbors.items():
-        if entry["router"] or ip == net["gateway"]:
-            router_macs.add(entry["mac"])
-    if not net["gateway"] and router_macs:
-        for ip in neighbors:
-            if neighbors[ip]["mac"] in router_macs:
-                net["gateway"] = ip
-                break
-
-    # 4. Names for online hosts.
-    online_ips = list(neighbors.keys())
-    rdns = reverse_names(online_ips[:64])
-    want_mdns = [
-        ip for ip in online_ips[:48]
-        if ip not in rdns or GENERIC_NAME_RE.match(label_from(rdns[ip]))
-    ]
-    mdns = mdns_names(want_mdns)
-
-    # 5. History + NEW flags (first-ever scan is a baseline, not a flood).
-    history_existed, history = load_history()
-    now = iso_now()
-    new_count = 0
-
-    devices = []
-    online_macs = set()
-    for ip, entry in neighbors.items():
-        mac = entry["mac"]
-        online_macs.add(mac)
-        vendor = ""
-        for table in oui_tables:
-            org = table.get(mac[:6], "")
-            if org:
-                vendor = vendor_short(org)
-                break
-
-        hostname = best_name(rdns, mdns, ip)
-        is_router = entry["mac"] in router_macs
-        key = mac  # devices are tracked by MAC
-
-        known = history.get(key)
-        is_new = False
-        if history_existed and not known and not is_router:
-            is_new = True
-
-        # Remembered names beat router-generated labels.
-        remembered = str((known or {}).get("name") or "")
-        if remembered and (not hostname or GENERIC_NAME_RE.match(hostname)):
-            hostname = remembered
-
-        # A generic label ("dhcp-10-5-7-3") is worse than the vendor name;
-        # drop it so the UI falls back to the vendor line.
-        if hostname and GENERIC_NAME_RE.match(hostname) and vendor:
-            hostname = ""
-
-        if is_router:
-            # Routers rarely carry a useful name; give them a stable one.
-            if not hostname:
-                hostname = "Gateway"
-
-        if is_new:
-            new_count += 1
-
-        devices.append({
-            "ip": ip,
-            "mac": mac,
-            "vendor": vendor,
-            "hostname": hostname,
-            "type": classify_device(vendor, hostname),
-            "isNew": is_new,
-            "router": is_router,
-            "self": False,
-            "online": True,
-            "state": entry["state"],
-            "first": (known or {}).get("first", now),
-            "lastSeen": now,
-        })
-
-        if not is_router:
-            if known:
-                known["last"] = now
-                if hostname and not known.get("name") and not GENERIC_NAME_RE.match(hostname):
-                    known["name"] = hostname
-            else:
-                history[key] = {
-                    "first": now,
-                    "last": now,
-                    "name": hostname if hostname and not GENERIC_NAME_RE.match(hostname) else "",
-                }
-
-    # The machine running the scan, for the "you" row.
-    devices.append({
-        "ip": self_ip,
-        "mac": self_mac,
-        "vendor": "",
-        "hostname": self_host,
-        "type": "laptop",
-        "isNew": False,
-        "router": False,
-        "self": True,
-        "online": True,
-        "state": "REACHABLE",
-        "first": now,
-        "lastSeen": now,
-    })
-
-    def sort_key(dev):
-        name = (dev["hostname"] or dev["vendor"] or dev["ip"] or "").lower()
-        if dev["router"]:
-            return (0, 0, "")
-        if dev["self"]:
-            return (1, 0, "")
-        if dev["isNew"]:
-            return (2, 0, name)
-        if not dev["online"]:
-            return (4, 0, name)
-        return (3, 0, name)
-
-    # 6. Away devices: things history knows, seen within a day, gone right
-    # now. Shown dimmed so the panel reads as "who's here" vs "who was here".
-    from datetime import datetime as _dt  # noqa: PLC0415
-    now_epoch = _dt.now(timezone.utc)
-
-    def _iso_epoch(text):
+            write_result_file(out_path, raw)
         try:
-            parsed = _dt.fromisoformat(str(text or ""))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.timestamp()
-        except Exception:  # noqa: BLE001
-            return None
+            sys.stdout.write(raw + "\n")
+            sys.stdout.flush()
+        except Exception:  # noqa: BLE001 - stdout may be closed/detached
+            pass
 
-    away_candidates = []
-    if history_existed:
-        for mac, meta in history.items():
-            if mac in online_macs or mac in router_macs or mac == self_mac:
-                continue
-            last_epoch = _iso_epoch(meta.get("last"))
-            if last_epoch is None or now_epoch.timestamp() - last_epoch > 24 * 3600:
-                continue
+    # The watchdog is armed before anything else can run away.
+    done = threading.Event()
+    threading.Thread(
+        target=watchdog_main,
+        args=(done, emit, deadline, scan_id),
+        daemon=True,
+        name="netneighbors-budget",
+    ).start()
+
+    lock_fd = None
+    try:
+        try:
+            lock_fd = acquire_scan_lock()
+        except RuntimeError as exc:
+            done.set()
+            emit(fail_payload(exc))
+            return
+
+        net = discover_network()
+        iface = net["iface"]
+        subnet = ipaddress.ip_network(net["network"])
+        self_ip = net["ip"]
+        self_mac = net.get("mac", "")
+        self_host = socket.gethostname() or "this device"
+        ssid = discover_ssid(iface)
+
+        candidates = {str(ip) for ip in subnet.hosts() if str(ip) != self_ip}
+        if not candidates:
+            raise RuntimeError("no addressable hosts in %s" % net["network"])
+
+        # 1. Probe sweep - ARP resolution is the point. Worker count and the
+        #    /4096 subnet guard keep the sweep bounded.
+        with ThreadPoolExecutor(max_workers=96) as pool:
+            list(pool.map(probe_host, candidates))
+        time.sleep(0.5)
+
+        # 2. Neighbor table.
+        neighbors = read_neighbors(iface, candidates)
+
+        # 3. Router: the route gateway, or anything the kernel flags as a router.
+        router_macs = set()
+        for ip, entry in neighbors.items():
+            if entry["router"] or ip == net["gateway"]:
+                router_macs.add(entry["mac"])
+        if not net["gateway"] and router_macs:
+            for ip in neighbors:
+                if neighbors[ip]["mac"] in router_macs:
+                    net["gateway"] = ip
+                    break
+
+        # 4. Names for online hosts (both helpers bound their own work).
+        online_ips = list(neighbors.keys())
+        rdns = reverse_names(online_ips[:64])
+        want_mdns = [
+            ip for ip in online_ips[:48]
+            if ip not in rdns or GENERIC_NAME_RE.match(label_from(rdns[ip]))
+        ]
+        mdns = mdns_names(want_mdns)
+
+        # 5. History + NEW flags (first-ever scan is a baseline, not a flood).
+        history_existed, history = load_history()
+        now = iso_now()
+
+        devices = []
+        online_macs = set()
+        for ip, entry in neighbors.items():
+            mac = entry["mac"]
+            online_macs.add(mac)
             vendor = ""
             for table in oui_tables:
                 org = table.get(mac[:6], "")
                 if org:
                     vendor = vendor_short(org)
                     break
-            remembered = str(meta.get("name") or "")
-            away_candidates.append({
-                "ip": "",
+
+            hostname = best_name(rdns, mdns, ip)
+            is_router = entry["mac"] in router_macs
+            key = mac  # devices are tracked by MAC
+
+            known = history.get(key)
+            is_new = False
+            if history_existed and not known and not is_router:
+                is_new = True
+
+            # Remembered names beat router-generated labels.
+            remembered = str((known or {}).get("name") or "")
+            if remembered and (not hostname or GENERIC_NAME_RE.match(hostname)):
+                hostname = remembered
+
+            # A generic label ("dhcp-10-5-7-3") is worse than the vendor name;
+            # drop it so the UI falls back to the vendor line.
+            if hostname and GENERIC_NAME_RE.match(hostname) and vendor:
+                hostname = ""
+
+            if is_router:
+                # Routers rarely carry a useful name; give them a stable one.
+                if not hostname:
+                    hostname = "Gateway"
+
+            devices.append({
+                "ip": ip,
                 "mac": mac,
                 "vendor": vendor,
-                "hostname": remembered,
-                "type": classify_device(vendor, remembered),
-                "isNew": False,
-                "router": False,
+                "hostname": hostname,
+                "type": classify_device(vendor, hostname),
+                "isNew": is_new,
+                "router": is_router,
                 "self": False,
-                "online": False,
-                "state": "",
-                "first": str(meta.get("first") or ""),
-                "lastSeen": str(meta.get("last") or ""),
-                "lastEpoch": last_epoch,
+                "online": True,
+                "state": entry["state"],
+                "first": (known or {}).get("first", now),
+                "lastSeen": now,
             })
-    away_candidates.sort(key=lambda d: d["lastEpoch"], reverse=True)
-    devices.extend(away_candidates[:8])
-    away_count = len(devices) - len([d for d in devices if d["online"]])
-    if away_candidates:
-        del away_candidates  # keep only capped entries in devices
 
-    online_others = sum(1 for d in devices if d["online"] and not d["self"])
+            if not is_router:
+                if known:
+                    known["last"] = now
+                    if hostname and not known.get("name") and not GENERIC_NAME_RE.match(hostname):
+                        known["name"] = hostname
+                else:
+                    history[key] = {
+                        "first": now,
+                        "last": now,
+                        "name": hostname if hostname and not GENERIC_NAME_RE.match(hostname) else "",
+                    }
 
-    # History housekeeping: keep the most recently seen 400 MACs.
-    if len(history) > 400:
-        ordered = sorted(
-            history.items(),
-            key=lambda kv: _iso_epoch(kv[1].get("last")) or 0,
-            reverse=True,
-        )
-        history = dict(ordered[:400])
-
-    devices.sort(key=sort_key)
-    save_history(history)
-
-    emit({
-        "ok": True,
-        "net": {
-            "iface": iface,
+        # The machine running the scan, for the "you" row.
+        devices.append({
             "ip": self_ip,
-            "cidr": net["network"],
-            "gateway": net["gateway"] or "",
-            "ssid": ssid or "",
-        },
-        "self": {"ip": self_ip, "mac": self_mac, "hostname": self_host},
-        "devices": devices,
-        "newCount": new_count,
-        "awayCount": away_count,
-        "onlineOtherCount": online_others,
-        "scanMs": int((time.monotonic() - started) * 1000),
-        "baselined": not history_existed,
-        "scannedAt": now,
-    })
+            "mac": self_mac,
+            "vendor": "",
+            "hostname": self_host,
+            "type": "laptop",
+            "isNew": False,
+            "router": False,
+            "self": True,
+            "online": True,
+            "state": "REACHABLE",
+            "first": now,
+            "lastSeen": now,
+        })
+
+        def sort_key(dev):
+            name = (dev["hostname"] or dev["vendor"] or dev["ip"] or "").lower()
+            if dev["router"]:
+                return (0, 0, "")
+            if dev["self"]:
+                return (1, 0, "")
+            if dev["isNew"]:
+                return (2, 0, name)
+            if not dev["online"]:
+                return (4, 0, name)
+            return (3, 0, name)
+
+        # 6. Away devices: things history knows, seen within a day, gone right
+        #    now. Shown dimmed so the panel reads as "who's here" vs "who was
+        #    here". Capped at MAX_AWAY_ROWS.
+        away_candidates = []
+        if history_existed:
+            for mac, meta in history.items():
+                if mac in online_macs or mac in router_macs or mac == self_mac:
+                    continue
+                last_epoch = _iso_epoch(meta.get("last"))
+                if last_epoch is None or datetime.now(timezone.utc).timestamp() - last_epoch > 24 * 3600:
+                    continue
+                vendor = ""
+                for table in oui_tables:
+                    org = table.get(mac[:6], "")
+                    if org:
+                        vendor = vendor_short(org)
+                        break
+                remembered = str(meta.get("name") or "")
+                away_candidates.append({
+                    "ip": "",
+                    "mac": mac,
+                    "vendor": vendor,
+                    "hostname": remembered,
+                    "type": classify_device(vendor, remembered),
+                    "isNew": False,
+                    "router": False,
+                    "self": False,
+                    "online": False,
+                    "state": "",
+                    "first": str(meta.get("first") or ""),
+                    "lastSeen": str(meta.get("last") or ""),
+                    "lastEpoch": last_epoch,
+                })
+        away_candidates.sort(key=lambda d: d["lastEpoch"], reverse=True)
+        devices.extend(away_candidates[:MAX_AWAY_ROWS])
+
+        # 7. Row cap: even a saturated /22 can never produce an unbounded
+        #    payload. Counts below are recomputed from the emitted rows so the
+        #    UI never advertises devices it cannot show.
+        devices.sort(key=sort_key)
+        if len(devices) > MAX_TOTAL_ROWS:
+            devices = devices[:MAX_TOTAL_ROWS]
+        new_count = sum(1 for d in devices if d["isNew"] and d["online"])
+        online_others = sum(1 for d in devices if d["online"] and not d["self"])
+        away_count = sum(1 for d in devices if not d["online"])
+
+        save_history(history)
+
+        payload = {
+            "ok": True,
+            "net": {
+                "iface": iface,
+                "ip": self_ip,
+                "cidr": net["network"],
+                "gateway": net["gateway"] or "",
+                "ssid": ssid or "",
+            },
+            "self": {"ip": self_ip, "mac": self_mac, "hostname": self_host},
+            "devices": devices,
+            "newCount": new_count,
+            "awayCount": away_count,
+            "onlineOtherCount": online_others,
+            "scanMs": int((time.monotonic() - started) * 1000),
+            "baselined": not history_existed,
+            "scannedAt": now,
+        }
+        if scan_id is not None:
+            payload["scanId"] = scan_id
+        done.set()
+        emit(payload)
+    except Exception as exc:  # noqa: BLE001 - boundary script: report, never crash
+        done.set()
+        emit(fail_payload(exc))
+    finally:
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

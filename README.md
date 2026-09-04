@@ -47,7 +47,8 @@ while closed) — toggle "Auto" in the footer to stop them.
 ## How it works
 
 `scanner.py` runs with **no privileges** and only stock tooling — nothing
-extra to install:
+extra to install beyond Python itself (`python3` on Arch; the shell invokes
+`/usr/bin/python3`):
 
 - Python 3 standard library (gzip, json, sockets, ipaddress, threads)
 - `ip` from iproute2 (always present on Arch)
@@ -73,8 +74,21 @@ extra to install:
    The first-ever scan is treated as a baseline, not a flood of "new"
    devices.
 
-The shell runs the scan fully detached and picks the result up from an
-atomically-written JSON file, so a shell reload never kills a scan mid-way.
+The shell runs the scanner as a **managed, time-boxed, single-instance
+process** and picks the result up from an atomically-written JSON file:
+
+- the scanner is a Quickshell `Process` child (never a detached process):
+  the shell knows its PID, sends it SIGTERM when a scan is superseded or
+  cancelled, and kills it on panel/shell reload or shutdown;
+- an `flock`-based lock file guarantees only one scan runs at a time — a
+  new scan retires a stale one instead of overlapping it;
+- a watchdog caps each scan at ~16 s, so a wedged run terminates itself;
+- every child command's output is captured with a byte ceiling, DNS lookups
+  are bounded in concurrency, and all state files (history, scan result)
+  are written via unpredictable temp names + atomic rename into a private
+  `0700` directory — no symlink-following or predictable `.tmp` writes;
+- the result payload is capped (rows, fields, bytes) by the scanner and the
+  same caps are enforced when the panel loads it.
 
 Only ever touches the local subnet you are already connected to; each scan
 is a few hundred tiny UDP datagrams plus one file read. No daemon, no root.
@@ -120,8 +134,16 @@ omarchy plugin remove io.github.i12bp8.netneighbors
 Plugins run **unsandboxed** inside the shell with your user permissions.
 This plugin is plain Python + QML, and the only thing it sends on the
 network is one UDP datagram per address (ARP resolution — replies are
-never parsed). Marketplace approval covers listing only, not auditing:
-review the source before enabling on machines you care about.
+never parsed).
+
+Hardening in place (see also "How it works" above): the scanner runs from
+an absolute interpreter path with an isolated interpreter and a
+whitelisted environment, it is single-instance and hard time-boxed, child
+command output and the result payload are byte/cardinality-bounded on both
+the producing and the consuming side, and the state directory is private
+with symlink-safe, atomic file writes. Marketplace approval covers listing
+only, not auditing: review the source before enabling on machines you care
+about.
 
 ## License
 

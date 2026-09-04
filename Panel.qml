@@ -16,8 +16,10 @@ import "ui/icons.js" as Icons
 // Structure: header (SSID + network facts), a filter row, then a single
 // scrolled list with ONLINE and AWAY section headers. Rows expand in place
 // (chevron) to reveal full detail, and hover tooltips carry the complete
-// info for anything elided. The heavy lifting happens in scanner.py; the
-// result arrives via an atomically-written JSON file watched by FileView.
+// info for anything elided. The heavy lifting happens in scanner.py, which
+// runs as a managed, time-boxed, single-instance process; its result
+// arrives via an atomically-written JSON file watched by FileView (see the
+// scan-pipeline contract below).
 Panel {
     id: root
     moduleName: "io.github.i12bp8.netneighbors"
@@ -76,13 +78,21 @@ Panel {
     }
 
     function startScan() {
-        if (root.scanning)
-            return;
+        // Managed scan lifecycle (see the scan-pipeline block below):
+        // supersede - never overlap - any scan that is still running, then
+        // launch a fresh one through the Quickshell Process handle.
+        root.cancelCurrentScan();
+        root.currentScanId++;
         root.scanning = true;
         root.lastError = "";
         stallTimer.restart();
         autoTimer.stop();
-        Quickshell.execDetached(["python3", root.scannerPath, "--out", root.scanFilePath]);
+        scanProcess.command = [
+            root.pythonPath, "-I", "-X", "utf8=1", // isolated, deterministic interpreter
+            root.scannerPath, "--out", root.scanFilePath,
+            "--scan-id", String(root.currentScanId)
+        ];
+        scanProcess.running = true; // quickshell starts it once the old one has exited
     }
 
     function open() {
@@ -300,16 +310,99 @@ Panel {
 
     // ---- scan pipeline ------------------------------------------------------
     //
-    // The scanner runs fully detached (Quickshell.execDetached) and writes
-    // its JSON result to a state file with an atomic replace. A FileView
-    // watches that file and reloads on every change, so scan results arrive
-    // by file event rather than by holding a subprocess open inside the
-    // shell (which Quickshell terminates on reload).
+    // Scan lifecycle + result contract (mirrored by scanner.py):
+    //  * scanner.py runs as a *managed* Quickshell Process, never detached:
+    //    Quickshell exposes its identity (processId), SIGTERMs it when a scan
+    //    is superseded or cancelled (`running = false`), and kills it when
+    //    this panel or the shell goes away. scanner.py additionally flock()s
+    //    a lock file, so two scan processes can never overlap no matter what.
+    //  * the interpreter is an absolute path (never PATH-resolved), runs
+    //    isolated (`-I`: no PYTHON*/user-site loading) with a whitelisted
+    //    environment (clearEnvironment) and forced UTF-8, so no inherited
+    //    loader environment can reach the scanner.
+    //  * result size/depth/cardinality contract: scanner.py caps the JSON
+    //    payload (bytes, rows, string lengths); this panel enforces the same
+    //    caps when a result arrives (onScanFile/onScanData), so an oversized
+    //    or malformed result can never stall or exhaust the shell.
+    //  * every result is tagged with the scan id it belongs to; while a scan
+    //    is in flight only its own result is accepted, and results older than
+    //    the newest accepted one are ignored.
     readonly property string scannerPath: Qt.resolvedUrl("scanner.py").toString().replace("file://", "")
+    readonly property string pythonPath: "/usr/bin/python3"
     readonly property string stateDir: (Quickshell.env("XDG_DATA_HOME") && Quickshell.env("XDG_DATA_HOME").length > 0
         ? Quickshell.env("XDG_DATA_HOME")
         : Quickshell.env("HOME") + "/.local/share") + "/io.github.i12bp8.netneighbors"
     readonly property string scanFilePath: root.stateDir + "/scan.json"
+
+    // Result input caps (consumer half of the size contract).
+    readonly property int maxResultChars: 2000000
+    readonly property int maxResultDevices: 768
+    readonly property int maxFieldLen: 160
+
+    // One scan generation at a time; results carry the id they belong to.
+    property int currentScanId: 0
+
+    // Whitelisted environment for the scanner child: with clearEnvironment
+    // below, only the variables returned here exist in the child. Values are
+    // read explicitly from the shell's own environment (never inherited
+    // implicitly), so HOME/XDG_DATA_HOME keep both sides of the file
+    // contract on identical paths.
+    readonly property var scanEnv: root.buildScanEnv()
+
+    function buildScanEnv() {
+        var env = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "LC_ALL": "C"
+        };
+        var passThrough = ["HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR",
+                           "DBUS_SESSION_BUS_ADDRESS"];
+        for (var i = 0; i < passThrough.length; i++) {
+            var value = Quickshell.env(passThrough[i]);
+            if (value && value.length > 0)
+                env[passThrough[i]] = value;
+        }
+        return env;
+    }
+
+    Process {
+        id: scanProcess
+        running: false
+        clearEnvironment: true
+        environment: root.scanEnv
+
+        // Parsers keep both pipes drained (a closed channel would SIGPIPE the
+        // scanner); their text is never parsed here - the atomically-written
+        // result file below is the delivery channel.
+        stdout: StdioCollector { waitForEnd: true }
+        stderr: StdioCollector { waitForEnd: true }
+
+        // Parameterless handler (like the built-in plugins): QProcess types
+        // are not registered QML types, so typed arguments would not compile.
+        onExited: {
+            killTimer.stop();
+        }
+    }
+
+    // SIGTERM escalation: a cancelled scan that is still alive after this
+    // delay gets SIGKILL, so a superseding scan can never wait on it.
+    Timer {
+        id: killTimer
+        interval: 1500
+        repeat: false
+        onTriggered: {
+            if (scanProcess.running)
+                scanProcess.signal(9); // SIGKILL
+        }
+    }
+
+    // Cancellation contract: SIGTERM via running = false, escalate if needed.
+    function cancelCurrentScan() {
+        killTimer.stop();
+        if (!scanProcess.running)
+            return;
+        scanProcess.running = false; // Quickshell sends SIGTERM to the child
+        killTimer.start();
+    }
 
     FileView {
         id: scanFile
@@ -333,95 +426,160 @@ Panel {
     }
 
     // Watchdog: a scan should take a few seconds. If nothing lands in time,
-    // give up on this attempt and let the next auto-scan try again.
+    // cancel the scanner process (cancellation contract) and let the next
+    // auto-scan try again.
     Timer {
         id: stallTimer
         interval: 20000
         repeat: false
         onTriggered: {
             if (root.scanning) {
-                root.scanning = false;
-                root.lastError = root.lastError || "scan timed out";
-                root.reflow();
-                root.syncHost();
-                root.armAuto();
+                root.cancelCurrentScan();
+                root.endScan(root.lastError === "" ? "scan timed out" : root.lastError);
             }
         }
     }
 
+    // Common end-of-attempt path: mirror scan state to the UI and re-arm the
+    // next automatic scan. Data/hasData semantics belong to the callers.
+    function endScan(error) {
+        if (error !== undefined && error !== null && String(error).length > 0)
+            root.lastError = String(error);
+        root.scanning = false;
+        stallTimer.stop();
+        root.reflow();
+        root.syncHost();
+        root.armAuto();
+    }
+
+    function dataFail(error) {
+        root.lastError = error || "Scan failed";
+        root.hasData = false;
+        root.endScan(root.lastError);
+    }
+
+    function clampStr(value, max) {
+        if (value === null || value === undefined)
+            return "";
+        var s = String(value);
+        return s.length > max ? s.slice(0, max) : s;
+    }
+
+    function clampInt(value, max, fallback) {
+        var n = parseInt(value, 10);
+        if (!isFinite(n))
+            n = fallback;
+        if (n < 0) n = 0;
+        if (n > max) n = max;
+        return n;
+    }
+
+    // Cardinality/depth bound: whatever produced the file, the UI only ever
+    // accepts this many rows and this much text per field.
+    function sanitizeDevices(list) {
+        var out = [];
+        if (!Array.isArray(list))
+            return out;
+        var max = Math.min(list.length, root.maxResultDevices);
+        for (var i = 0; i < max; i++) {
+            var d = list[i];
+            if (!d || typeof d !== "object")
+                continue;
+            out.push({
+                ip: root.clampStr(d.ip, 64),
+                mac: root.clampStr(d.mac, 32),
+                vendor: root.clampStr(d.vendor, 80),
+                hostname: root.clampStr(d.hostname, root.maxFieldLen),
+                type: root.clampStr(d.type, 32),
+                state: root.clampStr(d.state, 16),
+                isNew: !!d.isNew,
+                router: !!d.router,
+                self: !!d.self,
+                online: !!d.online,
+                first: root.clampStr(d.first, 40),
+                lastSeen: root.clampStr(d.lastSeen, 40)
+            });
+        }
+        return out;
+    }
+
     function onScanFile(raw) {
+        // Size bound (consumer half of the contract): refuse anything beyond
+        // the cap before it reaches JSON.parse.
+        if (typeof raw !== "string" || raw.length > root.maxResultChars) {
+            root.dataFail("scan result too large");
+            return;
+        }
         var data;
         try {
-            data = JSON.parse(String(raw || ""));
+            data = JSON.parse(raw);
         } catch (e) {
             return; // partial write - the atomic replace makes this rare
         }
-        if (!data || !data.ok) {
-            if (data && data.error)
-                root.lastError = data.error;
-            root.scanning = false;
-            root.hasData = false;
-            stallTimer.stop();
-            root.reflow();
-            root.syncHost();
-            root.armAuto();
+        if (!data || typeof data !== "object" || typeof data.ok !== "boolean")
+            return;
+        if (!data.ok) {
+            root.dataFail(data.error || "Scan failed");
             return;
         }
-        // Ignore results older than the ones we already hold.
-        if (root.hasData && data.scannedAt && root.lastScanAtValid
-            && new Date(data.scannedAt).getTime() <= root.lastScanAt.getTime())
+        // Process identity: while a scan is in flight, only accept the result
+        // tagged with the current scan id - a superseded scan may still have
+        // written its file just before it was cancelled.
+        if (root.scanning && typeof data.scanId === "number"
+            && data.scanId !== root.currentScanId)
             return;
+        // Ignore results older than the ones we already hold, keyed on the
+        // scanner's own timestamp so duplicate deliveries can never regress
+        // the view.
+        if (root.hasData && root.lastScanAtValid && typeof data.scannedAt === "string") {
+            var ts = new Date(data.scannedAt).getTime();
+            if (isFinite(ts) && ts <= root.lastScanAt.getTime())
+                return;
+        }
         root.onScanData(data);
     }
 
     function onScanData(data) {
-        if (!data || !data.ok) {
-            root.lastError = (data && data.error) || "Scan failed";
-            root.scanning = false;
-            root.hasData = false;
-            stallTimer.stop();
-            root.reflow();
-            root.syncHost();
-            root.armAuto();
-            return;
+        var devices = root.sanitizeDevices(data.devices);
+        var online = [], away = [];
+        var i;
+        for (i = 0; i < devices.length; i++) {
+            if (devices[i].online)
+                online.push(devices[i]);
+            else
+                away.push(devices[i]);
         }
 
         var prevSsid = root.ssid;
         var wasOnline = root.hasData;
-        root.ssid = data.net && data.net.ssid ? data.net.ssid : "";
-        root.cidr = data.net ? data.net.cidr : "";
-        root.gateway = data.net ? data.net.gateway : "";
-        root.ifaceName = data.net ? data.net.iface : "";
-        root.scanMs = data.scanMs || 0;
-        root.newCount = data.newCount || 0;
-        root.awayCount = data.awayCount || 0;
+        root.ssid = root.clampStr(data.net && data.net.ssid, 64);
+        root.cidr = root.clampStr(data.net && data.net.cidr, 64);
+        root.gateway = root.clampStr(data.net && data.net.gateway, 64);
+        root.ifaceName = root.clampStr(data.net && data.net.iface, 32);
+        root.scanMs = root.clampInt(data.scanMs, 3600000, 0);
         root.baselined = !!data.baselined;
-        root.otherCount = (typeof data.onlineOtherCount === "number")
-            ? data.onlineOtherCount
-            : Math.max(0, (data.devices || []).length - 1 - root.awayCount);
+        root.newCount = root.clampInt(data.newCount, devices.length, 0);
+        root.awayCount = away.length;
+        var other = 0;
+        for (i = 0; i < online.length; i++) {
+            if (!online[i].self)
+                other++;
+        }
+        root.otherCount = other;
         root.dismissedNew = false;
         root.hasData = true;
         root.lastError = "";
-        root.lastScanAt = new Date();
+
+        var scannedAt = root.clampStr(data.scannedAt, 40);
+        var scannedDate = new Date(scannedAt);
+        root.lastScanAt = (scannedAt !== "" && isFinite(scannedDate.getTime()))
+            ? scannedDate : new Date();
         root.lastScanAtValid = true;
 
-        var devices = data.devices || [];
-        var online = [], away = [];
-        for (var i = 0; i < devices.length; i++) {
-            var d = devices[i];
-            if (d.online)
-                online.push(d);
-            else
-                away.push(d);
-        }
         root.allOnline = online;
         root.allAway = away;
         root.rebuildModels();
-
-        root.scanning = false;
-        stallTimer.stop();
-        root.syncHost();
-        root.armAuto();
+        root.endScan("");
 
         // Moving between networks is worth announcing.
         if (wasOnline && prevSsid !== "" && root.ssid !== "" && prevSsid !== root.ssid)
@@ -491,6 +649,13 @@ Panel {
     onOpenedChanged: {
         if (root.opened)
             root.armAuto();
+    }
+
+    // Teardown contract: never leave a scan process running behind this
+    // panel (hot reload / shell shutdown). Quickshell additionally kills
+    // managed Process children whenever the shell itself goes away.
+    Component.onDestruction: {
+        root.cancelCurrentScan();
     }
 
     Component.onCompleted: {
