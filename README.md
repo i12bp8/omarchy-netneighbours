@@ -66,7 +66,9 @@ omarchy plugin enable io.github.i12bp8.netneighbors right
 The number beside the icon is the live count of *other* devices. Scans
 repeat automatically — about every 30 s while the panel is open, at least
 every minute while closed. Toggle the **Auto** switch in the panel footer
-(or press `A`) to stop background refreshes.
+(or press `A`) to stop background refreshes; the setting is remembered, so
+it stays off until you switch it back on. Opening the panel still fetches a
+fresh list either way — Auto only controls the repeating scans.
 
 Keyboard shortcuts inside the panel:
 
@@ -99,7 +101,8 @@ NetNeighbors is completely local:
   are kept in a small file at
   `~/.local/share/io.github.i12bp8.netneighbors/history.json` so it can
   tell you when something *new* appears. Delete that file any time — the
-  next scan just starts a fresh baseline.
+  next scan just starts a fresh baseline. The **Auto** switch is remembered
+  in `prefs.json` in the same folder.
 - **It only writes to its own folder.** NetNeighbors never changes your
   shell configuration or any other file.
 - **Be a good neighbor.** This is a tool for networks you own or are

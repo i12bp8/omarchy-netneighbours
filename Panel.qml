@@ -53,7 +53,7 @@ Panel {
     property int scanMs: 0
     property date lastScanAt: new Date(0)
     property bool lastScanAtValid: false
-    property bool autoRefresh: true     // session-only preference
+    property bool autoRefresh: true     // persisted, see the prefs block
     property bool dismissedNew: false   // "NEW devices" banner dismissed
     property bool hasData: false
     property string filterText: ""
@@ -75,6 +75,14 @@ Panel {
 
     function refresh() {
         root.startScan();
+    }
+
+    // Sole owner of the auto-refresh flag. ToggleSwitch is stateless about its
+    // own `checked` (the caller owns the value), so the footer switch and the
+    // `A` key both flip it here rather than assigning `checked` back to it.
+    // onAutoRefreshChanged below does the rest - timer and persistence.
+    function toggleAuto() {
+        root.autoRefresh = !root.autoRefresh;
     }
 
     function startScan() {
@@ -333,11 +341,13 @@ Panel {
         ? Quickshell.env("XDG_DATA_HOME")
         : Quickshell.env("HOME") + "/.local/share") + "/io.github.i12bp8.netneighbors"
     readonly property string scanFilePath: root.stateDir + "/scan.json"
+    readonly property string prefsFilePath: root.stateDir + "/prefs.json"
 
     // Result input caps (consumer half of the size contract).
     readonly property int maxResultChars: 2000000
     readonly property int maxResultDevices: 768
     readonly property int maxFieldLen: 160
+    readonly property int maxPrefsChars: 4096
 
     // One scan generation at a time; results carry the id they belong to.
     property int currentScanId: 0
@@ -412,6 +422,51 @@ Panel {
         printErrors: false
         onLoaded: root.onScanFile(text())
         onFileChanged: reload()
+    }
+
+    // Auto-refresh is a real preference, so it outlives the session: the
+    // panel is reloaded on every theme change and shell restart, and an
+    // in-memory flag would silently switch scanning back on each time.
+    // Same shape as the shell's own DND setting - atomic writes, a
+    // load guard, and a first-run branch for the missing file.
+    property bool prefsLoaded: false
+
+    FileView {
+        id: prefsFile
+        path: root.prefsFilePath
+        watchChanges: false
+        atomicWrites: true
+        printErrors: false
+        onLoaded: root.loadPrefs(text())
+        // First run: the file does not exist yet. Without this branch
+        // prefsLoaded stays false forever, savePrefs() never writes, and the
+        // preference is lost again on the next restart.
+        onLoadFailed: root.loadPrefs("")
+    }
+
+    function loadPrefs(raw) {
+        // FileView can fire onLoaded more than once during startup.
+        if (root.prefsLoaded)
+            return;
+        var value = true;
+        try {
+            // Bounded like every other file this panel reads.
+            var parsed = JSON.parse(String(raw || "").slice(0, root.maxPrefsChars));
+            if (parsed && typeof parsed.autoRefresh === "boolean")
+                value = parsed.autoRefresh;
+        } catch (e) {
+            // Missing or corrupt: keep the default and rewrite on the next toggle.
+        }
+        // Assigned before the guard flips, so hydration re-arms the timer
+        // through onAutoRefreshChanged without writing the value straight back.
+        root.autoRefresh = value;
+        root.prefsLoaded = true;
+    }
+
+    function savePrefs() {
+        if (!root.prefsLoaded)
+            return;
+        prefsFile.setText(JSON.stringify({ version: 1, autoRefresh: root.autoRefresh }, null, 2) + "\n");
     }
 
     // The result file may not exist when the panel starts (nothing watches
@@ -628,6 +683,13 @@ Panel {
         autoTimer.start();
     }
 
+    // armAuto() stops the timer first and returns early when auto is off, so
+    // it is the whole reaction in both directions - no separate stop path.
+    onAutoRefreshChanged: {
+        root.armAuto();
+        root.savePrefs();
+    }
+
     Timer {
         id: clockTimer
         interval: 1000
@@ -659,6 +721,12 @@ Panel {
     }
 
     Component.onCompleted: {
+        // Read the stored preference before anything arms a timer. FileView
+        // only reads when asked - without this neither onLoaded nor
+        // onLoadFailed ever fires, prefsLoaded stays false, and savePrefs()
+        // becomes a permanent no-op. (scanFile gets away with it because
+        // pollTimer reloads it every 1.5 s.)
+        prefsFile.reload();
         // First paint is instant; scan just after the shell settles.
         Qt.callLater(function () {
             root.startScan();
@@ -689,7 +757,7 @@ Panel {
                 if (t === "r" || t === "R")
                     root.startScan();
                 else if (t === "a" || t === "A")
-                    root.autoRefresh = !root.autoRefresh;
+                    root.toggleAuto();
                 else if (t === "f" || t === "F") {
                     filterField.forceActiveFocus();
                     filterField.selectAll();
@@ -1340,11 +1408,7 @@ Panel {
                             checked: root.autoRefresh
                             foreground: root.contentForeground
                             accent: root.contentAccent
-                            onToggled: {
-                                root.autoRefresh = checked;
-                                if (checked) root.armAuto();
-                                else autoTimer.stop();
-                            }
+                            onToggled: root.toggleAuto()
                         }
 
                         Text {
