@@ -60,6 +60,7 @@ Panel {
     property var allOnline: []          // master (unfiltered) device rows
     property var allAway: []
     property var expandedRows: ({})     // mac/ip -> expanded, driven by expandRevision
+    property var collapsedGroups: ({})  // group key -> collapsed, same revision clock
     property int expandRevision: 0
 
     readonly property int refreshSeconds: (function () {
@@ -250,42 +251,89 @@ Panel {
             kind: "header", label: label,
             ip: "", mac: "", vendor: "", hostname: "", type: "",
             isNew: false, router: false, self: false, online: false,
-            lastSeen: "", expanded: false
+            lastSeen: "", expanded: false, group: false, groupKey: ""
         };
+    }
+
+    // Collapsible section header (e.g. the UNKNOWN group). Carries the key
+    // its collapse state is stored under.
+    function groupEntry(label, key) {
+        return {
+            kind: "header", label: label,
+            ip: "", mac: "", vendor: "", hostname: "", type: "",
+            isNew: false, router: false, self: false, online: false,
+            lastSeen: "", expanded: false, group: true, groupKey: key
+        };
+    }
+
+    // A device the scan could not name or identify: no hostname and no vendor.
+    function isUnknown(d) {
+        if (!d)
+            return false;
+        var hn = d.hostname === undefined || d.hostname === null ? "" : d.hostname;
+        var vd = d.vendor === undefined || d.vendor === null ? "" : d.vendor;
+        return hn === "" && vd === "";
     }
 
     function rebuildModels() {
         deviceModel.clear();
-        var online = [], away = [];
-        for (var i = 0; i < root.allOnline.length; i++)
-            if (root.matchesFilter(root.allOnline[i]))
-                online.push(root.allOnline[i]);
+        var online = [], away = [], known = [], unknown = [];
+        for (var i = 0; i < root.allOnline.length; i++) {
+            if (!root.matchesFilter(root.allOnline[i]))
+                continue;
+            online.push(root.allOnline[i]);
+            if (root.isUnknown(root.allOnline[i]))
+                unknown.push(root.allOnline[i]);
+            else
+                known.push(root.allOnline[i]);
+        }
         for (var j = 0; j < root.allAway.length; j++)
             if (root.matchesFilter(root.allAway[j]))
                 away.push(root.allAway[j]);
 
-        deviceModel.append(root.headerEntry("ONLINE · " + online.length));
-        for (var k = 0; k < online.length; k++) {
-            var d = online[k];
+        deviceModel.append(root.headerEntry("ONLINE \u00b7 " + online.length));
+        for (var k = 0; k < known.length; k++) {
+            var d = known[k];
             d.kind = "row";
             d.expanded = false;
+            d.group = false;
+            d.groupKey = "";
             deviceModel.append(d);
         }
-        if (away.length > 0) {
-            deviceModel.append(root.headerEntry("AWAY · " + away.length));
-            for (var m = 0; m < away.length; m++) {
-                var a = away[m];
-                a.kind = "row";
-                a.expanded = false;
-                deviceModel.append(a);
+        if (unknown.length > 0) {
+            var unknownKey = "group:unknown";
+            deviceModel.append(root.groupEntry("UNKNOWN \u00b7 " + unknown.length, unknownKey));
+            if (!root.groupCollapsed(unknownKey)) {
+                for (var u = 0; u < unknown.length; u++) {
+                    var ud = unknown[u];
+                    ud.kind = "row";
+                    ud.expanded = false;
+                    ud.group = false;
+                    ud.groupKey = "";
+                    deviceModel.append(ud);
+                }
             }
         }
-        if (deviceModel.count <= 1) {
+        if (away.length > 0) {
+            var awayKey = "group:away";
+            deviceModel.append(root.groupEntry("AWAY \u00b7 " + away.length, awayKey));
+            if (!root.groupCollapsed(awayKey)) {
+                for (var m = 0; m < away.length; m++) {
+                    var a = away[m];
+                    a.kind = "row";
+                    a.expanded = false;
+                    a.group = false;
+                    a.groupKey = "";
+                    deviceModel.append(a);
+                }
+            }
+        }
+        if (online.length === 0 && away.length === 0) {
             deviceModel.append({
                 kind: "empty", label: "",
                 ip: "", mac: "", vendor: "", hostname: "", type: "",
                 isNew: false, router: false, self: false, online: false,
-                lastSeen: "", expanded: false
+                lastSeen: "", expanded: false, group: false, groupKey: ""
             });
         }
         root.reflow();
@@ -304,6 +352,20 @@ Panel {
         root.expandedRows[key] = !root.expandState(key);
         root.expandRevision++;
         root.reflow();
+    }
+
+    // Collapsible-group state, on the same revision clock as row expansion.
+    // Groups start collapsed (cleaner list); expanding is remembered for the
+    // session via an explicit false.
+    function groupCollapsed(key) {
+        root.expandRevision; // tracked dependency: forces re-evaluation
+        return root.collapsedGroups[key] !== false;
+    }
+
+    function toggleGroup(key) {
+        root.collapsedGroups[key] = !root.groupCollapsed(key);
+        root.expandRevision++;
+        root.rebuildModels();
     }
 
 
@@ -497,7 +559,9 @@ Panel {
                 self: !!d.self,
                 online: !!d.online,
                 first: root.clampStr(d.first, 40),
-                lastSeen: root.clampStr(d.lastSeen, 40)
+                lastSeen: root.clampStr(d.lastSeen, 40),
+                group: false,
+                groupKey: ""
             });
         }
         return out;
@@ -953,6 +1017,8 @@ Panel {
                         required property bool self
                         required property bool online
                         required property string lastSeen
+                        required property bool group
+                        required property string groupKey
 
                         id: row
                         readonly property string rowKey: mac !== "" ? mac : (ip !== "" ? ip : "self")
@@ -971,6 +1037,13 @@ Panel {
                             width: parent.width
                             height: parent.height
 
+                            MouseArea {
+                                anchors.fill: parent
+                                enabled: group
+                                cursorShape: group ? Qt.PointingHandCursor : Qt.ArrowCursor
+                                onClicked: root.toggleGroup(groupKey)
+                            }
+
                             Text {
                                 id: headerLabel
                                 anchors.left: parent.left
@@ -983,8 +1056,22 @@ Panel {
                                 font.letterSpacing: 1
                             }
 
-                            Rectangle {
+                            Text {
+                                id: headerChevron
+                                visible: group
                                 anchors.left: headerLabel.right
+                                anchors.leftMargin: Style.spacing.xs
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: root.groupCollapsed(groupKey)
+                                    ? Icons.GLYPH_CHEVRON_DOWN
+                                    : Icons.GLYPH_CHEVRON_UP
+                                color: Qt.darker(root.contentForeground, 1.6)
+                                font.family: root.contentFontFamily
+                                font.pixelSize: Style.font.caption
+                            }
+
+                            Rectangle {
+                                anchors.left: group ? headerChevron.right : headerLabel.right
                                 anchors.leftMargin: Style.spacing.md
                                 anchors.right: parent.right
                                 anchors.verticalCenter: parent.verticalCenter
