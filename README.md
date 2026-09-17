@@ -56,7 +56,10 @@ omarchy plugin enable io.github.i12bp8.netneighbors right
    range). Below it, one row per device: icon, name, IP, vendor and MAC.
    Your router is tagged **GATEWAY**, your own machine **YOU**, and
    anything new carries a **NEW** badge. Devices that were here recently
-   but aren't answering now sit under **AWAY**, dimmed.
+   but aren't answering now sit under **AWAY**, dimmed. Devices the scan
+   can't name or identify are tucked into a collapsible **UNKNOWN** group,
+   so a busy network stays readable — click the **AWAY** or **UNKNOWN**
+   header to expand or collapse it.
 3. **Copy an address** — click a row for its IP, right-click for its MAC
    (a small toast confirms). Useful for router admin pages and MAC filters.
 4. **Watch for newcomers.** If a device you've never seen appears while the
